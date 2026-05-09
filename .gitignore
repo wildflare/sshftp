@@ -1,0 +1,4 @@
+sshftp.exe
+*.o
+connections.json
+CLAUDE.md

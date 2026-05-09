@@ -1,0 +1,8 @@
+
+notepad $PROFILE
+↓
+
+Set-Alias -Name sshftp -Value D:\Tools\Network\sshftp\sshftp.exe
+
+
+
