@@ -704,7 +704,7 @@ static int delete_remote_recursive(const char *path,
         char child[1200]; snprintf(child, sizeof(child), "%s/%s", path, name);
         if (LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
             delete_remote_recursive(child, session, sftp);
-        else libssh2_sftp_unlink(sftp, child);
+        else { int rc; while ((rc=libssh2_sftp_unlink(sftp,child))==LIBSSH2_ERROR_EAGAIN) Sleep(10); }
     }
     libssh2_sftp_closedir(dh);
     int rc;
@@ -1016,9 +1016,10 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
                     snprintf(dst, sizeof(dst), "%s\\%s", op->path, e->name);
                     ok = e->is_dir ? download_dir(src,dst,session,sftp)
                                    : download_file(src,dst,session,sftp);
-                    if (ok==0 && key==KEY_F6)
-                        e->is_dir ? (void)delete_remote_recursive(src,session,sftp)
-                                  : (void)libssh2_sftp_unlink(sftp,src);
+                    if (ok==0 && key==KEY_F6) {
+                        if (e->is_dir) delete_remote_recursive(src,session,sftp);
+                        else { int rc; while ((rc=libssh2_sftp_unlink(sftp,src))==LIBSSH2_ERROR_EAGAIN) Sleep(10); }
+                    }
                 } else if (ap->is_remote && op->is_remote) {
                     snprintf(src, sizeof(src), "%s/%s", ap->path, e->name);
                     snprintf(dst, sizeof(dst), "%s/%s", op->path, e->name);
@@ -1072,8 +1073,8 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
                     e->is_dir ? delete_local_recursive(path) : (void)DeleteFileA(path);
                 } else {
                     snprintf(path, sizeof(path), "%s/%s", ap->path, e->name);
-                    e->is_dir ? delete_remote_recursive(path,session,sftp)
-                              : (void)libssh2_sftp_unlink(sftp,path);
+                    if (e->is_dir) delete_remote_recursive(path,session,sftp);
+                    else { int rc; while ((rc=libssh2_sftp_unlink(sftp,path))==LIBSSH2_ERROR_EAGAIN) Sleep(10); }
                 }
             }
             memset(ap->marked, 0, sizeof(ap->marked));
