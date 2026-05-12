@@ -67,7 +67,8 @@ static DWORD  g_orig_out_mode = 0;
 
 static volatile int g_running       = 0;
 static volatile int g_filer_active  = 0;
-static volatile int g_in_alt_screen = 0;  // リモートが代替スクリーン使用中
+static volatile int g_in_alt_screen     = 0;  // リモートが代替スクリーン使用中
+static volatile int g_cursor_needs_reset = 0;  // 代替スクリーン終了後にカーソルリセット
 
 static HANDLE g_filer_event = NULL;
 static HANDLE g_filer_done  = NULL;
@@ -1119,7 +1120,7 @@ static void scan_cursor_mode(const char *buf, int n) {
         // ESC[?1049h/l : 代替スクリーン切り替え（vim 等）
         if (buf[i+3]=='1' && buf[i+4]=='0' && buf[i+5]=='4' && buf[i+6]=='9') {
             if (buf[i+7] == 'h') { g_in_alt_screen = 1; continue; }
-            if (buf[i+7] == 'l') { g_in_alt_screen = 0; continue; }
+            if (buf[i+7] == 'l') { g_in_alt_screen = 0; g_cursor_needs_reset = 1; continue; }
         }
     }
 }
@@ -1145,6 +1146,11 @@ DWORD WINAPI recv_thread(LPVOID arg) {
         if (n > 0) {
             scan_cursor_mode(buf, n);
             DWORD w; WriteConsoleA(g_hOut, buf, n, &w, NULL);
+            // vim 等の終了後にカーソルをデフォルト（点滅）に戻す
+            if (g_cursor_needs_reset) {
+                g_cursor_needs_reset = 0;
+                WriteConsoleA(g_hOut, "\x1b[0 q", 5, &w, NULL);
+            }
         } else if (n == LIBSSH2_ERROR_EAGAIN) Sleep(10);
         else break;
     }
@@ -1310,6 +1316,7 @@ static int do_ssh(Connection *c) {
     CloseHandle(threads[0]); CloseHandle(threads[1]); CloseHandle(threads[2]);
     CloseHandle(g_filer_event); CloseHandle(g_filer_done); CloseHandle(g_recv_paused);
     DeleteCriticalSection(&g_ssh_cs);
+    wprint(ESC "[0 q" ESC "[?25h");  // カーソル形状をデフォルト（点滅）に戻す
     console_unraw();
 
 fail_channel:
