@@ -67,8 +67,9 @@ static DWORD  g_orig_out_mode = 0;
 
 static volatile int g_running       = 0;
 static volatile int g_filer_active  = 0;
-static volatile int g_in_alt_screen     = 0;  // リモートが代替スクリーン使用中
-static volatile int g_cursor_needs_reset = 0;  // 代替スクリーン終了後にカーソルリセット
+static volatile int g_in_alt_screen     = 0;
+static volatile int g_cursor_needs_reset = 0;
+static volatile int g_autowrap_off       = 0;  // ESC[?7l で折り返し無効中
 
 static HANDLE g_filer_event = NULL;
 static HANDLE g_filer_done  = NULL;
@@ -261,9 +262,11 @@ static void console_raw(void) {
     GetConsoleMode(g_hIn,  &g_raw_in);
     GetConsoleMode(g_hOut, &g_raw_out);
     // VTI: キーボード・マウスを VT シーケンスとして ReadFile に流す
-    // Windows Terminal がマウス VT 形式（SGR/X10）を自動で正しく生成する
     SetConsoleMode(g_hIn,  ENABLE_VIRTUAL_TERMINAL_INPUT);
     SetConsoleMode(g_hOut, ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    // SetConsoleMode が Windows Terminal の VT 状態をリセットして
+    // auto-wrap が OFF になることがあるため明示的に ON にする
+    wprint(ESC "[?7h");
 }
 static void console_unraw(void) {
     SetConsoleMode(g_hIn,  g_raw_in);
@@ -1115,12 +1118,23 @@ filer_done:
 
 // サーバー出力からカーソルモードと代替スクリーン使用状況を追跡
 static void scan_cursor_mode(const char *buf, int n) {
-    for (int i = 0; i < n - 7; i++) {  // ESC[?1049h は 8 バイト必要
+    for (int i = 0; i < n - 4; i++) {
         if ((unsigned char)buf[i] != 0x1b || buf[i+1] != '[' || buf[i+2] != '?') continue;
-        // ESC[?1049h/l : 代替スクリーン切り替え（vim 等）
+        // ESC[?7h/l : 自動折り返し
+        if (buf[i+3] == '7' && i+4 < n) {
+            if (buf[i+4] == 'h') { g_autowrap_off = 0; continue; }
+            if (buf[i+4] == 'l') { g_autowrap_off = 1; continue; }
+        }
+        if (i + 7 >= n) continue;
+        // ESC[?1049h/l : 代替スクリーン（新）
         if (buf[i+3]=='1' && buf[i+4]=='0' && buf[i+5]=='4' && buf[i+6]=='9') {
-            if (buf[i+7] == 'h') { g_in_alt_screen = 1; continue; }
-            if (buf[i+7] == 'l') { g_in_alt_screen = 0; g_cursor_needs_reset = 1; continue; }
+            if (buf[i+7]=='h') { g_in_alt_screen=1; continue; }
+            if (buf[i+7]=='l') { g_in_alt_screen=0; g_cursor_needs_reset=1; continue; }
+        }
+        // ESC[?47h/l : 代替スクリーン（旧 vi 等）
+        if (buf[i+3]=='0' && buf[i+4]=='0' && buf[i+5]=='4' && buf[i+6]=='7') {
+            if (buf[i+7]=='h') { g_in_alt_screen=1; continue; }
+            if (buf[i+7]=='l') { g_in_alt_screen=0; g_cursor_needs_reset=1; continue; }
         }
     }
 }
@@ -1149,7 +1163,14 @@ DWORD WINAPI recv_thread(LPVOID arg) {
             // vim 等の終了後にカーソルをデフォルト（点滅）に戻す
             if (g_cursor_needs_reset) {
                 g_cursor_needs_reset = 0;
-                WriteConsoleA(g_hOut, "\x1b[0 q", 5, &w, NULL);
+                g_autowrap_off = 0;
+                // vim 等の終了後にカーソル形状・点滅・自動折り返しをデフォルトに戻す
+                WriteConsoleA(g_hOut, "\x1b[0 q\x1b[?7h", 10, &w, NULL);
+            }
+            // 代替スクリーン外で折り返しが無効のままになっていたら強制回復
+            if (!g_in_alt_screen && g_autowrap_off) {
+                g_autowrap_off = 0;
+                WriteConsoleA(g_hOut, "\x1b[?7h", 5, &w, NULL);
             }
         } else if (n == LIBSSH2_ERROR_EAGAIN) Sleep(10);
         else break;
@@ -1278,7 +1299,9 @@ static int do_ssh(Connection *c) {
     g_recv_paused = CreateEvent(NULL, TRUE,  FALSE, NULL);
 
     g_running = 1;
-    g_in_alt_screen = 0;  // 接続開始時にリセット
+    g_in_alt_screen = 0;
+    g_autowrap_off  = 0;
+    wprint(ESC "[?7h");  // 接続開始時に自動折り返しを明示的に有効化
     console_raw();
 
     HANDLE threads[3];
