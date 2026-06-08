@@ -622,6 +622,8 @@ static void pane_reload(FilerPane *p, LIBSSH2_SESSION *session, LIBSSH2_SFTP *sf
 }
 
 // ===== ファイル転送 ===========================================
+static void progress_add_bytes(LONGLONG n);  // forward
+
 static int upload_file(const char *lpath, const char *rpath,
                        LIBSSH2_SESSION *session, LIBSSH2_SFTP *sftp) {
     FILE *f = fopen(lpath, "rb"); if (!f) return -1;
@@ -643,6 +645,7 @@ static int upload_file(const char *lpath, const char *rpath,
                 Sleep(10);
             if (rc < 0) { ok = -1; goto up_done; }
             sent += rc;
+            progress_add_bytes((LONGLONG)rc);
         }
     }
 up_done:
@@ -666,6 +669,7 @@ static int download_file(const char *rpath, const char *lpath,
         if (rc == 0) break;
         if (rc < 0) { ok = -1; break; }
         fwrite(buf, 1, rc, f);
+        progress_add_bytes((LONGLONG)rc);
     }
     libssh2_sftp_close(rh); fclose(f);
     if (ok < 0) DeleteFileA(lpath);
@@ -883,6 +887,86 @@ static void filer_status(int rows, const char *color, const char *msg) {
     move_xy(rows, 1); clr_line(); wprint(color); wprint(msg); wprint(RESET);
 }
 
+// ===== 進捗スピナー ============================================
+typedef struct {
+    volatile int   active;       // 0=停止, 1=回転中
+    volatile int   rows;         // ステータス行
+    volatile LONGLONG bytes;     // 転送済みバイト数（atomic 加算用）
+    char           label[256];   // 表示ラベル（操作+ファイル名）
+    HANDLE         thread;
+    CRITICAL_SECTION cs;
+} ProgressState;
+
+static ProgressState g_prog;
+
+static void fmt_bytes(LONGLONG b, char *out, size_t sz) {
+    if      (b < 1024LL)              snprintf(out, sz, "%lldB",   b);
+    else if (b < 1024LL*1024)         snprintf(out, sz, "%.1fK",   (double)b/1024);
+    else if (b < 1024LL*1024*1024)    snprintf(out, sz, "%.1fM",   (double)b/(1024*1024));
+    else                              snprintf(out, sz, "%.1fG",   (double)b/(1024LL*1024*1024));
+}
+
+DWORD WINAPI progress_thread(LPVOID arg) {
+    (void)arg;
+    static const char *frames[] = { "|", "/", "-", "\\" };
+    int fi = 0;
+    while (1) {
+        Sleep(120);
+        EnterCriticalSection(&g_prog.cs);
+        if (!g_prog.active) { LeaveCriticalSection(&g_prog.cs); break; }
+        LONGLONG b = g_prog.bytes;
+        char lbl[256]; safe_copy(lbl, sizeof(lbl), g_prog.label);
+        int rows = g_prog.rows;
+        LeaveCriticalSection(&g_prog.cs);
+
+        char bstr[32] = "";
+        if (b > 0) fmt_bytes(b, bstr, sizeof(bstr));
+
+        char line[512];
+        if (bstr[0])
+            snprintf(line, sizeof(line), " %s %s  %s", frames[fi], lbl, bstr);
+        else
+            snprintf(line, sizeof(line), " %s %s", frames[fi], lbl);
+        fi = (fi + 1) % 4;
+
+        move_xy(rows, 1); clr_line();
+        wprint(C_YEL); wprint(line); wprint(RESET);
+    }
+    return 0;
+}
+
+static void progress_start(int rows, const char *label) {
+    EnterCriticalSection(&g_prog.cs);
+    g_prog.active = 1;
+    g_prog.rows   = rows;
+    g_prog.bytes  = 0;
+    safe_copy(g_prog.label, sizeof(g_prog.label), label);
+    LeaveCriticalSection(&g_prog.cs);
+    g_prog.thread = CreateThread(NULL, 0, progress_thread, NULL, 0, NULL);
+}
+
+static void progress_set_label(const char *label) {
+    EnterCriticalSection(&g_prog.cs);
+    safe_copy(g_prog.label, sizeof(g_prog.label), label);
+    g_prog.bytes = 0;
+    LeaveCriticalSection(&g_prog.cs);
+}
+
+static void progress_add_bytes(LONGLONG n) {
+    InterlockedExchangeAdd64(&g_prog.bytes, n);
+}
+
+static void progress_stop(void) {
+    EnterCriticalSection(&g_prog.cs);
+    g_prog.active = 0;
+    LeaveCriticalSection(&g_prog.cs);
+    if (g_prog.thread) {
+        WaitForSingleObject(g_prog.thread, 1000);
+        CloseHandle(g_prog.thread);
+        g_prog.thread = NULL;
+    }
+}
+
 // マーク数カウント
 static int pane_marked_count(FilerPane *p) {
     int n = 0;
@@ -925,6 +1009,8 @@ static void detect_dir_color(LIBSSH2_SESSION *session) {
 
 // ===== ファイラーメインループ =================================
 static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
+    memset(&g_prog, 0, sizeof(g_prog));
+    InitializeCriticalSection(&g_prog.cs);
     detect_dir_color(session);
 
     LIBSSH2_SFTP *sftp;
@@ -999,13 +1085,27 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
             if (ap->count == 0) break;
             int mc = pane_marked_count(ap);
             int err = 0;
+            int total_files = 0;
+            // 対象件数を数える
+            for (int idx = 0; idx < ap->count; idx++)
+                if (mc ? ap->marked[idx] : idx == ap->selected)
+                    if (strcmp(ap->entries[idx].name, "..") != 0) total_files++;
+            int cur_file = 0;
             for (int idx = 0; idx < ap->count; idx++) {
                 if (mc ? !ap->marked[idx] : idx != ap->selected) continue;
                 FilerEntry *e = &ap->entries[idx];
                 if (strcmp(e->name, "..") == 0) continue;
-                char smsg[280];
-                snprintf(smsg, sizeof(smsg), " %s: %s ...", key==KEY_F5?"Copy":"Move", e->name);
-                filer_status(rows, C_DIM, smsg);
+                cur_file++;
+                char smsg[320];
+                if (total_files > 1)
+                    snprintf(smsg, sizeof(smsg), "%s [%d/%d] %s",
+                             key==KEY_F5 ? "Copy" : "Move",
+                             cur_file, total_files, e->name);
+                else
+                    snprintf(smsg, sizeof(smsg), "%s: %s",
+                             key==KEY_F5 ? "Copy" : "Move", e->name);
+                if (cur_file == 1) progress_start(rows, smsg);
+                else               progress_set_label(smsg);
                 int ok = -1;
                 char src[1200], dst[1200];
                 if (!ap->is_remote && op->is_remote) {
@@ -1045,6 +1145,7 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
                 }
                 if (ok != 0) err = 1;
             }
+            progress_stop();
             memset(ap->marked, 0, sizeof(ap->marked));
             pane_reload(op, session, sftp);
             if (key == KEY_F6) pane_reload(ap, session, sftp);
@@ -1067,10 +1168,24 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
             filer_status(rows, C_ERR, cmsg);
             int confirm = read_key();
             if (confirm != 'y' && confirm != 'Y') break;
+            {
+                char dmsg[280];
+                if (mc > 0)
+                    snprintf(dmsg, sizeof(dmsg), "Delete %d files", mc);
+                else
+                    snprintf(dmsg, sizeof(dmsg), "Delete: %.200s",
+                             ap->entries[ap->selected].name);
+                progress_start(rows, dmsg);
+            }
             for (int idx = 0; idx < ap->count; idx++) {
                 if (mc ? !ap->marked[idx] : idx != ap->selected) continue;
                 FilerEntry *e = &ap->entries[idx];
                 if (strcmp(e->name, "..") == 0) continue;
+                if (mc > 1) {
+                    char dmsg[280];
+                    snprintf(dmsg, sizeof(dmsg), "Delete: %.200s", e->name);
+                    progress_set_label(dmsg);
+                }
                 char path[1200];
                 if (!ap->is_remote) {
                     snprintf(path, sizeof(path), "%s\\%s", ap->path, e->name);
@@ -1081,6 +1196,7 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
                     else { int rc; while ((rc=libssh2_sftp_unlink(sftp,path))==LIBSSH2_ERROR_EAGAIN) Sleep(10); }
                 }
             }
+            progress_stop();
             memset(ap->marked, 0, sizeof(ap->marked));
             pane_reload(ap, session, sftp);
             break;
@@ -1110,6 +1226,7 @@ static void run_filer(LIBSSH2_SESSION *session, Connection *c) {
     }
 filer_done:
     libssh2_sftp_shutdown(sftp);
+    DeleteCriticalSection(&g_prog.cs);
     if (use_alt) wprint(ESC "[?1049l");  // 通常シェル: 元画面を完全復元
     else         wprint(ESC "[?25h");    // vim 使用中: SIGWINCH で再描画
 }
